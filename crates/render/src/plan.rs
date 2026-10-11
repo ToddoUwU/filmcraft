@@ -159,7 +159,7 @@ fn cpu_frame(img: crate::Image) -> Arc<VideoFrame> {
 }
 
 fn simple_transition(id: &str) -> bool {
-    matches!(id, "cross_dissolve" | "dip_to_black" | "dip_to_white" | "morph_cut")
+    matches!(id, "cross_dissolve" | "dip_to_black" | "dip_to_white")
 }
 
 /// The standard effects of a media clip if the GPU can draw it (any blend mode, no opacity masks,
@@ -191,12 +191,7 @@ fn gpu_chain<'a>(project: &Project, item: &'a TrackItem, opts: RenderOptions) ->
 pub fn plan_frame(project: &Project, seq_id: ItemId, t: Tick, opts: RenderOptions, sources: &dyn SourceProvider) -> FramePlan {
     let Some(seq) = project.sequence(seq_id) else { return FramePlan::Image(crate::Image::new(1, 1)) };
     let (w, h) = output_size(seq, opts.scale);
-    // HDR / wide-gamut sequences composite and convert on the CPU.
-    if !seq.settings.color.is_plain() {
-        return FramePlan::Image(crate::render_sequence(project, seq_id, t, opts, sources));
-    }
-    // Whole-frame fallback: adjustment layers or complex transitions anywhere at t.
-    if !layered_at(project, seq, t) {
+    if whole_frame_on_cpu(project, seq, t) {
         return FramePlan::Image(crate::render_sequence(project, seq_id, t, opts, sources));
     }
     let mut layers = PlanStack::default();
@@ -212,6 +207,20 @@ pub fn plan_frame(project: &Project, seq_id: ItemId, t: Tick, opts: RenderOption
         }
     }
     layers.finish(w, h)
+}
+
+/// Whether [`plan_frame`] hands the frame at `t` back as one CPU image ([`FramePlan::Image`]). A
+/// GPU renderer gains nothing on such a frame, so a caller with only a few of them (the export's
+/// pool) can render it on the CPU without taking one.
+pub fn is_cpu_frame(project: &Project, seq_id: ItemId, t: Tick) -> bool {
+    project.sequence(seq_id).is_none_or(|seq| whole_frame_on_cpu(project, seq, t))
+}
+
+/// The frames [`plan_frame`] does not plan: an HDR / wide-gamut sequence composites and converts
+/// on the CPU, and so does a frame with an adjustment layer or a complex transition anywhere at
+/// `t` (whole-frame fallback).
+fn whole_frame_on_cpu(project: &Project, seq: &Sequence, t: Tick) -> bool {
+    !seq.settings.color.is_plain() || !layered_at(project, seq, t)
 }
 
 /// Whether the frame of `seq` at `t` can be planned as layers: no adjustment layer and no
@@ -340,7 +349,7 @@ fn push_item(
         && let Some(angle) = item.multicam_angle(nested)
         && !(opts.effects && item.has_standard_effects())
         && (nested.settings.width, nested.settings.height) == (seq.settings.width, seq.settings.height)
-        && near_identity(&motion_matrix(seq, item, (nested.settings.width, nested.settings.height), mt))
+        && near_identity(&motion_matrix(seq, item, (nested.settings.width, nested.settings.height), Some(nested.settings.par), mt))
         && let Some(tr) = nested.angle_video_track_index(angle).and_then(|i| nested.video_tracks.get(i))
         && !tr.transitions.iter().any(|x| x.range().contains(ft))
         && tr.item_at(ft).is_none_or(|i| crate::opacity_blend(i, i.effect_time_at(ft)).1 != Blend::Dissolve)
@@ -362,7 +371,7 @@ fn push_item(
         && !item.has_opacity_masks()
         && bl == Blend::Normal
         && extra_opacity * op >= 1.0 - 1e-6
-        && near_identity(&motion_matrix(seq, item, (nested.settings.width, nested.settings.height), mt))
+        && near_identity(&motion_matrix(seq, item, (nested.settings.width, nested.settings.height), Some(nested.settings.par), mt))
         && nest_is_plain(project, seq, nested, ft)
     {
         push_tracks(project, nested, ft, opts, sources, nest + 1, out);
@@ -384,7 +393,7 @@ fn push_item(
     {
         let Some(size) = crate::source_size(project, item.item) else { return };
         let (w, h) = output_size(seq, opts.scale);
-        let m = Affine::scale(opts.scale as f64, opts.scale as f64).then_apply(&motion_matrix(seq, item, size, mt));
+        let m = Affine::scale(opts.scale as f64, opts.scale as f64).then_apply(&motion_matrix(seq, item, size, None, mt));
         if let Some((img, x, y)) = crate::graphic_clip::render_graphic_tight(item, mt, size, &m, w, h) {
             out.push(PlanLayer::new(cpu_frame(img), Affine::translate(x as f64, y as f64), op * extra_opacity, bl));
         }
@@ -393,7 +402,7 @@ fn push_item(
     if let Some(chain) = gpu_chain(project, item, opts) {
         let Some(src) = sources.source(item.item) else { return };
         let Some(size) = crate::source_size(project, item.item) else { return };
-        let motion = motion_matrix(seq, item, size, mt);
+        let motion = motion_matrix(seq, item, size, crate::source_par(project, item.item), mt);
         let lin = ((motion.a * motion.a + motion.b * motion.b).sqrt()).max((motion.c * motion.c + motion.d * motion.d).sqrt());
         let want = (lin * opts.scale as f64).clamp(1.0 / 64.0, 1.0) as f32;
         let time = crate::video_source_time(item, t, src.info().frame_rate());
